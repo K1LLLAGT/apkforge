@@ -1,0 +1,500 @@
+#!/usr/bin/env bash
+# apkforge — ApkForge headless engine (CLI)
+#
+# Turns APKs (single, split bundles, .apk+/.apks/.xapk/.apkm, or installed
+# packages) into per-app projects:
+#
+#   <out>/<slug>/
+#     input/        original + extracted/merged APKs
+#     apktool/      smali + decoded res  -> `apkforge rebuild`
+#     jadx/         Java source as a Gradle project (Android Studio)
+#     dist/         rebuilt / signed APKs
+#     rebuild.sh    shortcut for `apkforge rebuild <this dir>`
+#     info.txt  decompile.log  .done
+#
+# This CLI is the reference engine for the ApkForge app (com.gt.apkforge):
+# the project layout above is the contract the app UI reads.
+set -uo pipefail
+
+VERSION="0.2.0"
+APKFORGE_OUT="${APKFORGE_OUT:-$HOME/ApkForge/projects}"
+APKFORGE_SRC="${APKFORGE_SRC:-/sdcard/backups/apps}"
+APKFORGE_PULL="${APKFORGE_PULL:-$HOME/ApkForge/pulled}"
+TOOLS_DIR="${APKFORGE_TOOLS:-$HOME/.local/share/apkforge}"
+APKEDITOR="${APKEDITOR:-$TOOLS_DIR/APKEditor.jar}"
+KEYSTORE="${APKFORGE_KEYSTORE:-$HOME/.android/debug.keystore}"
+JADX_MEM="${JADX_MEM:-3g}"
+THREADS="$(nproc 2>/dev/null || echo 4)"
+
+# ---------------------------------------------------------------- output
+if [[ -t 1 ]]; then c_g=$'\e[32m'; c_y=$'\e[33m'; c_r=$'\e[31m'; c_b=$'\e[36m'; c_d=$'\e[2m'; c_0=$'\e[0m'
+else c_g=; c_y=; c_r=; c_b=; c_d=; c_0=; fi
+info(){ printf '%s[*]%s %s\n' "$c_b" "$c_0" "$*"; }
+ok(){   printf '%s[+]%s %s\n' "$c_g" "$c_0" "$*"; }
+warn(){ printf '%s[!]%s %s\n' "$c_y" "$c_0" "$*" >&2; }
+err(){  printf '%s[x]%s %s\n' "$c_r" "$c_0" "$*" >&2; }
+die(){  err "$*"; exit 1; }
+has(){  command -v "$1" >/dev/null 2>&1; }
+need(){ local m=(); for t in "$@"; do has "$t" || m+=("$t"); done
+        (( ${#m[@]} )) && die "missing: ${m[*]}  (run: apkforge setup)"; return 0; }
+
+slugify(){
+  local s; s=$(basename "$1")
+  s="${s%.apk+}"; s="${s%.apks}"; s="${s%.xapk}"; s="${s%.apkm}"; s="${s%.apk}"
+  printf '%s' "$s" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9.]+/_/g; s/^_+|_+$//g'
+}
+
+is_apk_like(){ [[ "${1,,}" =~ \.(apk|apk\+|apks|xapk|apkm)$ ]]; }
+
+resolve_project(){
+  # accepts a path or a slug under $APKFORGE_OUT
+  local p="$1"
+  [[ -d "$p" ]] && { (cd "$p" && pwd); return; }
+  [[ -d "$APKFORGE_OUT/$p" ]] && { echo "$APKFORGE_OUT/$p"; return; }
+  die "no such project: $p  (see: apkforge list)"
+}
+
+# ---------------------------------------------------------------- shared option parsing
+OPT_OUT=""; OPT_ONLY=""; OPT_FORCE=0; OPT_APKTOOL=1; OPT_JADX=1; OPT_DEOBF=0
+OPT_MERGE=1; OPT_YES=0; OPT_DECOMPILE=0; OPT_OUTFILE=""
+ARGS=()
+parse_opts(){
+  ARGS=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|--out)        OPT_OUT="$2"; shift 2;;
+      --only)          OPT_ONLY="$2"; shift 2;;
+      -f|--force)      OPT_FORCE=1; shift;;
+      --no-apktool)    OPT_APKTOOL=0; shift;;
+      --no-jadx)       OPT_JADX=0; shift;;
+      --smali-only)    OPT_JADX=0; shift;;
+      --java-only)     OPT_APKTOOL=0; shift;;
+      --deobf)         OPT_DEOBF=1; shift;;
+      --no-merge)      OPT_MERGE=0; shift;;
+      -j|--threads)    THREADS="$2"; shift 2;;
+      -m|--mem)        JADX_MEM="$2"; shift 2;;
+      -y|--yes)        OPT_YES=1; shift;;
+      -d|--decompile)  OPT_DECOMPILE=1; shift;;
+      --output)        OPT_OUTFILE="$2"; shift 2;;
+      --) shift; ARGS+=("$@"); break;;
+      -h|--help)       cmd_help; exit 0;;
+      -*)              die "unknown option: $1";;
+      *)               ARGS+=("$1"); shift;;
+    esac
+  done
+  export JAVA_OPTS="-Xmx${JADX_MEM}" JADX_OPTS="-Xmx${JADX_MEM}"
+}
+
+# ---------------------------------------------------------------- engine pieces
+apkeditor_ok(){ [[ -f "$APKEDITOR" ]]; }
+
+fetch_apkeditor(){
+  mkdir -p "$TOOLS_DIR"
+  info "fetching latest APKEditor.jar"
+  local url
+  url=$(curl -fsSL https://api.github.com/repos/REAndroid/APKEditor/releases/latest \
+        | grep -o '"browser_download_url": *"[^"]*\.jar"' | head -1 | sed 's/.*"\(http[^"]*\)"/\1/')
+  [[ -n "$url" ]] && curl -fL -o "$APKEDITOR" "$url" && { ok "APKEditor -> $APKEDITOR"; return 0; }
+  warn "APKEditor download failed"; return 1
+}
+
+ensure_keystore(){
+  [[ -f "$KEYSTORE" ]] && return 0
+  need keytool
+  mkdir -p "$(dirname "$KEYSTORE")"
+  info "creating debug keystore at $KEYSTORE"
+  keytool -genkeypair -keystore "$KEYSTORE" -storepass android -keypass android \
+    -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+    -dname "CN=Android Debug,O=Android,C=US" >/dev/null 2>&1 || die "keytool failed"
+}
+
+pick_base(){ # dir of apks -> best base apk path
+  local d="$1" b=""
+  [[ -f "$d/base.apk" ]] && { echo "$d/base.apk"; return; }
+  b=$(find "$d" -maxdepth 1 -name '*.apk' ! -name 'split_config*' ! -name 'config.*' \
+        -printf '%s %p\n' | sort -nr | head -1 | cut -d' ' -f2-)
+  [[ -z "$b" ]] && b=$(find "$d" -maxdepth 1 -name '*.apk' -printf '%s %p\n' | sort -nr | head -1 | cut -d' ' -f2-)
+  echo "$b"
+}
+
+merge_splits(){ # splits_dir out.apk
+  apkeditor_ok || return 1
+  java -jar "$APKEDITOR" m -i "$1" -o "$2" >>"${LOG:-/dev/null}" 2>&1 && [[ -s "$2" ]]
+}
+
+# prepare_input <file-or-dir> <project-dir>  -> sets INPUT_APK, SPLIT_NOTE
+prepare_input(){
+  local src="$1" dir="$2"
+  mkdir -p "$dir/input/splits"
+  if [[ -d "$src" ]]; then
+    cp -f "$src"/*.apk "$dir/input/splits/" 2>/dev/null || { err "no .apk files in $src"; return 1; }
+  else
+    cp -f "$src" "$dir/input/original" || return 1
+    local listing; listing=$(unzip -Z1 "$src" 2>/dev/null) || { err "not a zip/APK: $src"; return 1; }
+    if grep -qx 'AndroidManifest.xml' <<<"$listing"; then
+      cp -f "$src" "$dir/input/app.apk"; rmdir "$dir/input/splits" 2>/dev/null
+      INPUT_APK="$dir/input/app.apk"; SPLIT_NOTE="single APK"; return 0
+    fi
+    grep -qE '\.apk$' <<<"$listing" || { err "no manifest and no embedded .apk in $src"; return 1; }
+    unzip -o -j -q "$src" '*.apk' -d "$dir/input/splits" || return 1
+    local others; others=$(grep -vE '\.apk$|/$' <<<"$listing" | head -50)
+    [[ -n "$others" ]] && printf '%s\n' "$others" > "$dir/input/other_entries.txt"
+  fi
+  local n base; n=$(find "$dir/input/splits" -maxdepth 1 -name '*.apk' | wc -l)
+  base=$(pick_base "$dir/input/splits")
+  if (( n == 1 )); then INPUT_APK="$base"; SPLIT_NOTE="bundle: 1 APK"; return 0; fi
+  if (( OPT_MERGE )) && apkeditor_ok; then
+    info "  merging $n splits (APKEditor)"
+    if merge_splits "$dir/input/splits" "$dir/input/merged.apk"; then
+      INPUT_APK="$dir/input/merged.apk"; SPLIT_NOTE="bundle: $n splits merged"; return 0
+    fi
+    warn "  merge failed — using base APK"
+  fi
+  INPUT_APK="$base"; SPLIT_NOTE="bundle: $n splits, base only ($(basename "$base"))"
+}
+
+run_apktool(){
+  local dir="$1"
+  if apktool d -f -o "$dir/apktool" "$INPUT_APK" >>"$LOG" 2>&1; then APKTOOL_STATUS="ok"; return; fi
+  warn "  apktool failed on resources; retrying with -r"
+  rm -rf "$dir/apktool"
+  if apktool d -f -r -o "$dir/apktool" "$INPUT_APK" >>"$LOG" 2>&1
+  then APKTOOL_STATUS="ok (-r: resources not decoded)"
+  else APKTOOL_STATUS="FAILED"; fi
+}
+
+run_jadx(){
+  local dir="$1" rc
+  local a=(--export-gradle --show-bad-code -j "$THREADS" -d "$dir/jadx")
+  (( OPT_DEOBF )) && a+=(--deobf)
+  jadx "${a[@]}" "$INPUT_APK" >>"$LOG" 2>&1; rc=$?
+  if find "$dir/jadx" -name '*.java' -print -quit 2>/dev/null | grep -q .; then
+    if (( rc == 0 )); then JADX_STATUS="ok"
+    else JADX_STATUS="ok with errors (~$(grep -c ERROR "$LOG" || true), see log)"; fi
+  else JADX_STATUS="FAILED"; fi
+}
+
+badging(){ has aapt && aapt dump badging "$1" 2>/dev/null \
+  | grep -E "^(package|sdkVersion|targetSdkVersion|application-label):"; }
+
+write_project_meta(){
+  local dir="$1" src="$2"
+  cat > "$dir/rebuild.sh" <<'EOF'
+#!/usr/bin/env bash
+exec apkforge rebuild "$(cd "$(dirname "$0")" && pwd)" "$@"
+EOF
+  chmod +x "$dir/rebuild.sh"
+  {
+    echo "source:  $src"
+    echo "input:   ${INPUT_APK#"$dir"/}"
+    echo "type:    $SPLIT_NOTE"
+    echo "date:    $(date -Iseconds)"
+    echo "engine:  apkforge $VERSION"
+    badging "$INPUT_APK" || { [[ -f "$dir/apktool/apktool.yml" ]] && \
+      grep -E 'versionCode|versionName|minSdkVersion|targetSdkVersion' "$dir/apktool/apktool.yml"; }
+    echo
+    echo "apktool: $APKTOOL_STATUS"
+    echo "jadx:    $JADX_STATUS"
+  } > "$dir/info.txt"
+}
+
+# decompile_one <file-or-dir> <out-root> [slug] -> sets RESULT
+decompile_one(){
+  local src="$1" root="$2" slug="${3:-$(slugify "$1")}"
+  local dir="$root/$slug"
+  if [[ -f "$dir/.done" && $OPT_FORCE -eq 0 ]]; then
+    ok "already done: $slug (use -f to redo)"; RESULT="SKIP  $slug"; return 0
+  fi
+  rm -rf "$dir"; mkdir -p "$dir"
+  LOG="$dir/decompile.log"; : > "$LOG"
+  INPUT_APK=""; SPLIT_NOTE=""; APKTOOL_STATUS="skipped"; JADX_STATUS="skipped"
+  prepare_input "$src" "$dir" || { RESULT="FAIL  $slug (bad input)"; return 1; }
+  info "  $SPLIT_NOTE"
+  (( OPT_APKTOOL )) && { info "  apktool d"; run_apktool "$dir"; }
+  (( OPT_JADX ))    && { info "  jadx --export-gradle"; run_jadx "$dir"; }
+  write_project_meta "$dir" "$src"
+  local st="OK  "
+  [[ $APKTOOL_STATUS == FAILED || $JADX_STATUS == FAILED ]] && st="PART"
+  [[ $APKTOOL_STATUS == FAILED && $JADX_STATUS == FAILED ]] && st="FAIL"
+  [[ $st != FAIL ]] && touch "$dir/.done"
+  ok "  apktool: $APKTOOL_STATUS | jadx: $JADX_STATUS"
+  ok "  -> $dir"
+  RESULT="$st  $slug  [$SPLIT_NOTE]"
+  [[ $st != FAIL ]]
+}
+
+sign_apk(){ # in out
+  need apksigner; ensure_keystore
+  local tmp="${2%.apk}.aligned.apk"
+  if has zipalign; then zipalign -f -p 4 "$1" "$tmp" || return 1
+  else warn "zipalign missing (pkg install aapt) — signing unaligned"; cp -f "$1" "$tmp"; fi
+  apksigner sign --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android \
+    --out "$2" "$tmp" && rm -f "$tmp" "$2.idsig" && apksigner verify "$2"
+}
+
+# ---------------------------------------------------------------- commands
+cmd_help(){ cat <<EOF
+${c_b}apkforge $VERSION${c_0} — ApkForge decompile engine
+
+${c_g}Setup${c_0}
+  apkforge setup                     install deps, fetch APKEditor, link into \$PATH
+  apkforge doctor                    check tools, versions, storage, keystore
+  apkforge version
+
+${c_g}Inspect${c_0}
+  apkforge info <apk|bundle>         package, version, SDKs, split list
+  apkforge apps [filter]             list installed packages (for pull)
+
+${c_g}Acquire${c_0}
+  apkforge pull <package> [-d]       copy an installed app's APK(s); -d = decompile too
+
+${c_g}Decompile${c_0}
+  apkforge decompile <apk|bundle|dir>   one app -> its own project
+  apkforge batch [dir]               every APK in dir (default: $APKFORGE_SRC)
+     options:  -o DIR  --only REGEX  -f/--force  --deobf  --no-merge
+               --smali-only  --java-only  -j N  -m 3g
+
+${c_g}Build${c_0}
+  apkforge rebuild <project>         apktool b -> zipalign -> sign -> dist/
+  apkforge merge <bundle|dir> [--output out.apk]   merge splits into one APK
+  apkforge sign <apk> [--output out.apk]           zipalign + debug-sign
+  apkforge install <project|apk>     open the APK in the system installer
+
+${c_g}Manage${c_0}
+  apkforge list                      projects + status
+  apkforge show <project>            print a project's info.txt
+  apkforge log <project>             view its decompile.log
+  apkforge clean <project> | --all [-y]
+
+Env: APKFORGE_OUT=$APKFORGE_OUT
+     APKFORGE_SRC=$APKFORGE_SRC   JADX_MEM=$JADX_MEM   APKEDITOR=$APKEDITOR
+EOF
+}
+
+cmd_version(){ echo "apkforge $VERSION"; }
+
+cmd_setup(){
+  if has pkg; then
+    info "installing packages"
+    pkg install -y openjdk-17 apktool jadx aapt apksigner unzip zip curl || warn "pkg install had errors"
+  else warn "pkg not found — install openjdk, apktool, jadx, aapt, apksigner manually"; fi
+  apkeditor_ok || fetch_apkeditor || true
+  ensure_keystore
+  local self; self=$(readlink -f "$0")
+  if [[ -n "${PREFIX:-}" && -d "$PREFIX/bin" ]]; then
+    ln -sf "$self" "$PREFIX/bin/apkforge" && ok "linked: $PREFIX/bin/apkforge -> $self"
+  fi
+  mkdir -p "$APKFORGE_OUT" "$APKFORGE_PULL"
+  cmd_doctor
+}
+
+cmd_doctor(){
+  local t v bad=0
+  printf '%-11s %s\n' "tool" "status"
+  for t in java apktool jadx unzip aapt zipalign apksigner keytool pm curl; do
+    if has "$t"; then
+      case $t in
+        java)    v=$(java -version 2>&1 | head -1);;
+        apktool) v=$(apktool --version 2>/dev/null | head -1);;
+        jadx)    v=$(jadx --version 2>/dev/null | head -1);;
+        *)       v="found";;
+      esac
+      printf '%-11s %s%s%s\n' "$t" "$c_g" "$v" "$c_0"
+    else
+      printf '%-11s %smissing%s\n' "$t" "$c_r" "$c_0"
+      [[ $t =~ ^(java|apktool|jadx|unzip)$ ]] && bad=1
+    fi
+  done
+  apkeditor_ok && printf '%-11s %s%s%s\n' APKEditor "$c_g" "$APKEDITOR" "$c_0" \
+               || printf '%-11s %smissing (splits -> base only)%s\n' APKEditor "$c_y" "$c_0"
+  [[ -f "$KEYSTORE" ]] && printf '%-11s %s%s%s\n' keystore "$c_g" "$KEYSTORE" "$c_0" \
+                       || printf '%-11s %swill be created on first sign%s\n' keystore "$c_y" "$c_0"
+  [[ -r "$APKFORGE_SRC" ]] && printf '%-11s %s\n' "src" "$APKFORGE_SRC" \
+                           || printf '%-11s %s%s not readable (termux-setup-storage?)%s\n' src "$c_y" "$APKFORGE_SRC" "$c_0"
+  mkdir -p "$APKFORGE_OUT"
+  printf '%-11s %s (%s free)\n' "out" "$APKFORGE_OUT" "$(df -h "$APKFORGE_OUT" | awk 'NR==2{print $4}')"
+  printf '%-11s %s threads, jadx heap %s\n' "jobs" "$THREADS" "$JADX_MEM"
+  (( bad )) && { err "required tools missing — run: apkforge setup"; return 1; }
+  ok "ready"
+}
+
+cmd_info(){
+  parse_opts "$@"; [[ ${#ARGS[@]} -ge 1 ]] || die "usage: apkforge info <apk|bundle>"
+  need unzip
+  local f="${ARGS[0]}" tmp; [[ -e "$f" ]] || die "not found: $f"
+  tmp=$(mktemp -d)
+  OPT_MERGE=0; LOG=/dev/null
+  prepare_input "$f" "$tmp/p" >/dev/null || { rm -rf "$tmp"; return 1; }
+  echo "file:  $f ($(du -h "$f" | cut -f1))"
+  echo "type:  $SPLIT_NOTE"
+  [[ -d "$tmp/p/input/splits" ]] && find "$tmp/p/input/splits" -name '*.apk' -printf '         %f  (%s bytes)\n' | sort
+  badging "$INPUT_APK" || warn "aapt missing — install aapt for package details"
+  [[ -f "$tmp/p/input/other_entries.txt" ]] && { echo "other entries:"; sed 's/^/         /' "$tmp/p/input/other_entries.txt"; }
+  rm -rf "$tmp"
+}
+
+cmd_apps(){
+  need pm
+  local f="${1:-}"
+  pm list packages -3 2>/dev/null | sed 's/^package://' | sort | { [[ -n $f ]] && grep -i -- "$f" || cat; }
+}
+
+cmd_pull(){
+  parse_opts "$@"; [[ ${#ARGS[@]} -ge 1 ]] || die "usage: apkforge pull <package> [-d]"
+  need pm
+  local pkg="${ARGS[0]}" paths dest
+  paths=$(pm path "$pkg" 2>/dev/null | sed 's/^package://')
+  if [[ -z "$paths" ]] && has su; then
+    warn "pm returned nothing as Termux user; trying root"
+    paths=$(su -c "pm path $pkg" 2>/dev/null | sed 's/^package://')
+  fi
+  [[ -n "$paths" ]] || die "package not found or not visible: $pkg"
+  dest="$APKFORGE_PULL/$pkg"; rm -rf "$dest"; mkdir -p "$dest"
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    cp -f "$p" "$dest/" 2>/dev/null || { has su && su -c "cat '$p'" > "$dest/$(basename "$p")"; } \
+      || die "cannot read $p"
+    info "  $(basename "$p")"
+  done <<<"$paths"
+  ok "pulled $(ls "$dest" | wc -l) APK(s) -> $dest"
+  if (( OPT_DECOMPILE )); then
+    need java apktool jadx
+    decompile_one "$dest" "${OPT_OUT:-$APKFORGE_OUT}" "$pkg"
+  fi
+}
+
+cmd_decompile(){
+  parse_opts "$@"; [[ ${#ARGS[@]} -ge 1 ]] || die "usage: apkforge decompile <apk|bundle|dir> [opts]"
+  need java unzip; (( OPT_APKTOOL )) && need apktool; (( OPT_JADX )) && need jadx
+  local rc=0 f root="${OPT_OUT:-$APKFORGE_OUT}"
+  mkdir -p "$root"
+  for f in "${ARGS[@]}"; do
+    [[ -e "$f" ]] || { err "not found: $f"; rc=1; continue; }
+    printf '\n%s== %s%s\n' "$c_b" "$(basename "$f")" "$c_0"
+    decompile_one "$f" "$root" || rc=1
+  done
+  return $rc
+}
+
+cmd_batch(){
+  parse_opts "$@"
+  need java unzip; (( OPT_APKTOOL )) && need apktool; (( OPT_JADX )) && need jadx
+  local src="${ARGS[0]:-$APKFORGE_SRC}" root="${OPT_OUT:-$APKFORGE_OUT}" files=() f i=0
+  [[ -d "$src" ]] || die "not a directory: $src"
+  mkdir -p "$root"
+  while IFS= read -r -d '' f; do
+    is_apk_like "$f" || continue
+    [[ -n "$OPT_ONLY" ]] && ! grep -qiE "$OPT_ONLY" <<<"$(basename "$f")" && continue
+    files+=("$f")
+  done < <(find "$src" -maxdepth 1 -type f -print0 | sort -z)
+  (( ${#files[@]} )) || die "no matching APKs in $src"
+  info "${#files[@]} app(s): $src -> $root"
+  apkeditor_ok || warn "APKEditor missing: bundles decompile base.apk only (apkforge setup)"
+  local summary=()
+  for f in "${files[@]}"; do
+    i=$((i+1)); printf '\n%s== [%d/%d] %s%s\n' "$c_b" "$i" "${#files[@]}" "$(basename "$f")" "$c_0"
+    decompile_one "$f" "$root"; summary+=("$RESULT")
+  done
+  printf '\n%s===== summary =====%s\n' "$c_b" "$c_0"
+  printf '%s\n' "${summary[@]}" | tee "$root/summary.txt"
+}
+
+cmd_rebuild(){
+  parse_opts "$@"; [[ ${#ARGS[@]} -ge 1 ]] || die "usage: apkforge rebuild <project>"
+  need apktool
+  local dir; dir=$(resolve_project "${ARGS[0]}")
+  [[ -d "$dir/apktool" ]] || die "no apktool/ in $dir (decompiled with --java-only?)"
+  mkdir -p "$dir/dist"
+  info "apktool b"
+  apktool b "$dir/apktool" -o "$dir/dist/unsigned.apk" "${ARGS[@]:1}" || die "apktool build failed"
+  info "align + sign"
+  sign_apk "$dir/dist/unsigned.apk" "$dir/dist/rebuilt-signed.apk" || die "signing failed"
+  ok "$dir/dist/rebuilt-signed.apk"
+  warn "new signature: uninstall the original before installing"
+}
+
+cmd_merge(){
+  parse_opts "$@"; [[ ${#ARGS[@]} -ge 1 ]] || die "usage: apkforge merge <bundle|dir> [--output out.apk]"
+  apkeditor_ok || die "APKEditor missing (apkforge setup)"
+  need java unzip
+  local src="${ARGS[0]}" out="${OPT_OUTFILE:-$(slugify "${ARGS[0]}")-merged.apk}" tmp
+  tmp=$(mktemp -d)
+  if [[ -d "$src" ]]; then cp -f "$src"/*.apk "$tmp/"; else unzip -o -j -q "$src" '*.apk' -d "$tmp" || die "no APKs inside $src"; fi
+  LOG=/dev/stderr merge_splits "$tmp" "$out" || { rm -rf "$tmp"; die "merge failed"; }
+  rm -rf "$tmp"; ok "$out"
+}
+
+cmd_sign(){
+  parse_opts "$@"; [[ ${#ARGS[@]} -ge 1 ]] || die "usage: apkforge sign <apk> [--output out.apk]"
+  local in="${ARGS[0]}" out="${OPT_OUTFILE:-${ARGS[0]%.apk}-signed.apk}"
+  sign_apk "$in" "$out" && ok "$out"
+}
+
+cmd_install(){
+  [[ $# -ge 1 ]] || die "usage: apkforge install <project|apk>"
+  local apk="$1"
+  [[ -f "$apk" ]] || apk="$(resolve_project "$1")/dist/rebuilt-signed.apk"
+  [[ -f "$apk" ]] || die "no APK found (run: apkforge rebuild $1)"
+  has termux-open || die "termux-open missing (pkg install termux-tools)"
+  # the installer can't read Termux-private paths: stage on shared storage
+  local stage="/sdcard/Download/apkforge"; mkdir -p "$stage"
+  cp -f "$apk" "$stage/$(basename "$(dirname "$(dirname "$apk")")")-$(basename "$apk")"
+  termux-open "$stage/$(basename "$(dirname "$(dirname "$apk")")")-$(basename "$apk")"
+}
+
+cmd_list(){
+  local d n=0
+  [[ -d "$APKFORGE_OUT" ]] || { info "no projects yet"; return; }
+  printf '%-4s  %-40s  %-8s  %-8s  %s\n' "" "project" "apktool" "jadx" "type"
+  for d in "$APKFORGE_OUT"/*/; do
+    [[ -f "$d/info.txt" ]] || continue; n=$((n+1))
+    local s="FAIL" a j t
+    [[ -f "$d/.done" ]] && s="ok"
+    a=$(sed -n 's/^apktool: //p' "$d/info.txt" | cut -c1-8)
+    j=$(sed -n 's/^jadx: *//p'   "$d/info.txt" | cut -c1-8)
+    t=$(sed -n 's/^type: *//p'   "$d/info.txt" | cut -c1-30)
+    printf '%-4s  %-40s  %-8s  %-8s  %s\n' "$s" "$(basename "$d")" "$a" "$j" "$t"
+  done
+  (( n )) || info "no projects yet"
+}
+
+cmd_show(){ [[ $# -ge 1 ]] || die "usage: apkforge show <project>"; cat "$(resolve_project "$1")/info.txt"; }
+cmd_log(){  [[ $# -ge 1 ]] || die "usage: apkforge log <project>"; "${PAGER:-less}" "$(resolve_project "$1")/decompile.log"; }
+
+cmd_clean(){
+  parse_opts "$@"
+  if [[ "${ARGS[0]:-}" == "--all" ]] || [[ " $* " == *" --all "* ]]; then
+    (( OPT_YES )) || { read -rp "delete ALL projects in $APKFORGE_OUT? [y/N] " a; [[ $a == [yY] ]] || return; }
+    rm -rf "${APKFORGE_OUT:?}"/*; ok "cleaned"; return
+  fi
+  [[ ${#ARGS[@]} -ge 1 ]] || die "usage: apkforge clean <project> | --all [-y]"
+  local dir; dir=$(resolve_project "${ARGS[0]}")
+  (( OPT_YES )) || { read -rp "delete $dir? [y/N] " a; [[ $a == [yY] ]] || return; }
+  rm -rf "$dir"; ok "removed $dir"
+}
+
+# ---------------------------------------------------------------- dispatch
+main(){
+  local c="${1:-help}"; shift || true
+  case "$c" in
+    help|-h|--help) cmd_help;;
+    version|-V|--version) cmd_version;;
+    setup)     cmd_setup "$@";;
+    doctor)    cmd_doctor "$@";;
+    info)      cmd_info "$@";;
+    apps)      cmd_apps "$@";;
+    pull)      cmd_pull "$@";;
+    decompile|d) cmd_decompile "$@";;
+    batch|b)   cmd_batch "$@";;
+    rebuild|r) cmd_rebuild "$@";;
+    merge)     cmd_merge "$@";;
+    sign)      cmd_sign "$@";;
+    install)   cmd_install "$@";;
+    list|ls)   cmd_list "$@";;
+    show)      cmd_show "$@";;
+    log)       cmd_log "$@";;
+    clean)     cmd_clean "$@";;
+    *) err "unknown command: $c"; cmd_help; exit 1;;
+  esac
+}
+main "$@"
