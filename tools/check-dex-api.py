@@ -26,10 +26,13 @@ def main():
     api_xml = sorted(glob.glob(os.path.join(sdk, "platforms", "android-*", "data", "api-versions.xml")))[-1]
     dexdump = sorted(glob.glob(os.path.join(sdk, "build-tools", "*", "dexdump")))[-1]
 
+    def ver(v):  # "36.1" style minor SDK versions appear in newer platforms
+        return int(float(v))
+
     classes = {}
     for c in ET.parse(api_xml).getroot().findall("class"):
-        since = int(c.get("since", "1"))
-        meths = {m.get("name"): int(m.get("since", since)) for m in c.findall("method")}
+        since = ver(c.get("since", "1"))
+        meths = {m.get("name"): ver(m.get("since", since)) for m in c.findall("method")}
         sup = [e.get("name") for e in c.findall("extends")] + [e.get("name") for e in c.findall("implements")]
         classes[c.get("name")] = (since, meths, sup)
 
