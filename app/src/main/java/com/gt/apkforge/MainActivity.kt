@@ -149,6 +149,7 @@ class MainActivity : ComponentActivity() {
         override fun onServiceDisconnected(n: ComponentName) {
             service = null
             if (busy) { lines += "[x] engine process died (likely out of memory)"; busy = false }
+            if (!started) unbindOnce()
         }
     }
     private val replies = Messenger(Handler(Looper.getMainLooper()) { m ->
@@ -163,21 +164,25 @@ class MainActivity : ComponentActivity() {
                 m.data.getString("apk")?.let { lastApk = File(it) }
                 lines += "(${(System.currentTimeMillis() - t0) / 1000}s, ${m.data.getString("heap")})"
                 busy = false
+                if (!started) unbindOnce()
             }
         }
         true
     })
     private var t0 = 0L
     private var bound = false
+    private var started = false
 
     override fun onStart() {
         super.onStart()
+        started = true
         hasAccess = Storage.hasAllFilesAccess()
         if (!bound) bound = bindService(Intent(this, ForgeService::class.java), conn, BIND_AUTO_CREATE)
     }
 
     override fun onStop() {
         super.onStop()
+        started = false
         // keep the connection while a job runs so a dying :forge process still reaches onServiceDisconnected
         if (!busy) unbindOnce()
     }
