@@ -168,15 +168,28 @@ class MainActivity : ComponentActivity() {
         true
     })
     private var t0 = 0L
+    private var bound = false
 
     override fun onStart() {
         super.onStart()
         hasAccess = Storage.hasAllFilesAccess()
-        bindService(Intent(this, ForgeService::class.java), conn, BIND_AUTO_CREATE)
+        if (!bound) bound = bindService(Intent(this, ForgeService::class.java), conn, BIND_AUTO_CREATE)
     }
 
     override fun onStop() {
         super.onStop()
+        // keep the connection while a job runs so a dying :forge process still reaches onServiceDisconnected
+        if (!busy) unbindOnce()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        unbindOnce()
+    }
+
+    private fun unbindOnce() {
+        if (!bound) return
+        bound = false
         unbindService(conn)
         service = null
     }
@@ -189,12 +202,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun runImport(uri: Uri) {
-        val name = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
-            if (it.moveToFirst()) it.getString(0) else null
-        } ?: "picked.apk"
         busy = true; lines.clear()
         thread(name = "import") {
             try {
+                val name = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+                    if (it.moveToFirst()) it.getString(0) else null
+                } ?: "picked.apk"
                 val dir = File(cacheDir, "import").apply { deleteRecursively(); mkdirs() }
                 val file = File(dir, name)
                 runOnUiThread { lines += "[*] copying $name" }
@@ -204,7 +217,7 @@ class MainActivity : ComponentActivity() {
                     if (!ProjectLayout.isApkLike(name)) lines += "[!] $name: not .apk/.apks/.xapk/.apkm/.apk+ — trying anyway"
                     submit(ForgeService.DECOMPILE, Bundle().apply {
                         putString("src", file.path); putString("out", Storage.projectsRoot(this@MainActivity).path)
-                        putString("label", name)
+                        putString("label", name); putBoolean("temp", true)
                     })
                 }
             } catch (t: Throwable) {
