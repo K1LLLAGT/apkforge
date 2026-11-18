@@ -43,8 +43,9 @@ echo "== rebuild"
 
 echo "== split bundle (.apks)"
 if [[ -f "$AAB" ]]; then
-  BTV=$(curl -fsSL https://dl.google.com/dl/android/maven2/com/android/tools/build/bundletool/maven-metadata.xml | grep -o '<release>[^<]*' | sed 's/<release>//')
-  curl -fsSL -o "$OUT/bundletool.jar" "https://dl.google.com/dl/android/maven2/com/android/tools/build/bundletool/$BTV/bundletool-$BTV.jar"
+  # runnable "all" jar is only published on GitHub releases (Maven's jar has no Main-Class)
+  BTV=$(git ls-remote --tags https://github.com/google/bundletool | grep -oE 'refs/tags/[0-9.]+$' | sed 's|refs/tags/||' | sort -V | tail -1)
+  curl -fsSL -o "$OUT/bundletool.jar" "https://github.com/google/bundletool/releases/download/$BTV/bundletool-all-$BTV.jar"
   java -jar "$OUT/bundletool.jar" build-apks --bundle="$AAB" --output="$OUT/sample.apks"
   unzip -l "$OUT/sample.apks" | tail -n +4 | head -20
   "$ENGINE" decompile "$OUT/sample.apks" -o "$OUT" --smali-only
