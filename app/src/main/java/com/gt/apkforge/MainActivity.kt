@@ -1,9 +1,18 @@
 package com.gt.apkforge
 
+import android.content.ComponentName
 import android.content.Intent
+import android.content.ServiceConnection
 import android.content.pm.ApplicationInfo
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.Message
+import android.os.Messenger
+import android.os.RemoteException
 import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -39,16 +48,12 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
-import com.gt.apkforge.engine.Forge
-import com.gt.apkforge.engine.ForgeLog
 import com.gt.apkforge.engine.ProjectLayout
-import com.gt.apkforge.engine.Rebuilder
-import com.gt.apkforge.engine.Stage
 import java.io.File
 import kotlin.concurrent.thread
 
 /**
- * Phase 1 engine test bench: run the in-process engine on a picked file or installed app
+ * Engine test bench (jobs run in the :forge process): run the in-process engine on a picked file or installed app
  * and show its log. Replaced by the full UI in later phases.
  */
 class MainActivity : ComponentActivity() {
@@ -58,7 +63,7 @@ class MainActivity : ComponentActivity() {
     private var lastProject by mutableStateOf<File?>(null)
     private var lastApk by mutableStateOf<File?>(null)
 
-    private val outRoot get() = File(getExternalFilesDir(null), "projects").apply { mkdirs() }
+    private var hasAccess by mutableStateOf(Storage.hasAllFilesAccess())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -77,7 +82,12 @@ class MainActivity : ComponentActivity() {
         }
         Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("ApkForge engine bench", style = MaterialTheme.typography.titleLarge)
-            Text("out: $outRoot", style = MaterialTheme.typography.bodySmall)
+            Text("out: ${Storage.projectsRoot(this@MainActivity)}", style = MaterialTheme.typography.bodySmall)
+            if (!hasAccess && Build.VERSION.SDK_INT >= 30) {
+                TextButton(onClick = { startActivity(Storage.allFilesAccessIntent(this@MainActivity)) }) {
+                    Text("Grant all-files access (use /sdcard/ApkForge)")
+                }
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(enabled = !busy, onClick = { picker.launch(arrayOf("*/*")) }) { Text("Pick file") }
                 Button(enabled = !busy, onClick = { showApps = true }) { Text("Installed app") }
@@ -133,61 +143,89 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    private val uiLog = object : ForgeLog {
-        override fun info(msg: String) = post("[*] $msg")
-        override fun ok(msg: String) = post("[+] $msg")
-        override fun warn(msg: String) = post("[!] $msg")
-        override fun progress(stage: Stage, fraction: Float?) {
-            runOnUiThread {
-                this@MainActivity.stage = stage.label + (fraction?.let { " ${(it * 100).toInt()}%" } ?: "")
-            }
+    private var service: Messenger? = null
+    private val conn = object : ServiceConnection {
+        override fun onServiceConnected(n: ComponentName, b: IBinder) { service = Messenger(b) }
+        override fun onServiceDisconnected(n: ComponentName) {
+            service = null
+            if (busy) { lines += "[x] engine process died (likely out of memory)"; busy = false }
         }
     }
-
-    private fun post(s: String) = runOnUiThread { lines += s }
-
-    private fun background(name: String, block: () -> Unit) {
-        busy = true
-        lines.clear()
-        thread(name = name) {
-            val t0 = System.currentTimeMillis()
-            try {
-                block()
-            } catch (t: Throwable) {
-                post("[x] ${t.javaClass.simpleName}: ${t.message}")
-                ForgeLog.stackTrace(t).lineSequence().take(15).forEach { post(it) }
-            } finally {
-                post("(${(System.currentTimeMillis() - t0) / 1000}s, heap max ${Runtime.getRuntime().maxMemory() shr 20} MB)")
-                runOnUiThread { busy = false }
+    private val replies = Messenger(Handler(Looper.getMainLooper()) { m ->
+        val t = m.data.getString("t").orEmpty()
+        when (m.what) {
+            ForgeService.R_LINE -> lines += t
+            ForgeService.R_STAGE -> stage = t
+            ForgeService.R_DONE -> {
+                val err = m.data.getString("error")
+                err?.lines()?.forEachIndexed { i, l -> lines += if (i == 0) "[x] $l" else l }
+                m.data.getString("project")?.let { if (err == null) lastProject = File(it) }
+                m.data.getString("apk")?.let { lastApk = File(it) }
+                lines += "(${(System.currentTimeMillis() - t0) / 1000}s, ${m.data.getString("heap")})"
+                busy = false
             }
         }
+        true
+    })
+    private var t0 = 0L
+
+    override fun onStart() {
+        super.onStart()
+        hasAccess = Storage.hasAllFilesAccess()
+        bindService(Intent(this, ForgeService::class.java), conn, BIND_AUTO_CREATE)
     }
 
-    private fun runImport(uri: Uri) = background("decompile") {
+    override fun onStop() {
+        super.onStop()
+        unbindService(conn)
+        service = null
+    }
+
+    private fun submit(what: Int, data: Bundle) {
+        val s = service ?: run { lines += "[x] engine process not ready, try again"; return }
+        lines.clear(); busy = true; t0 = System.currentTimeMillis()
+        try { s.send(Message.obtain().also { it.what = what; it.data = data; it.replyTo = replies }) }
+        catch (e: RemoteException) { lines += "[x] ${e.message}"; busy = false }
+    }
+
+    private fun runImport(uri: Uri) {
         val name = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
             if (it.moveToFirst()) it.getString(0) else null
         } ?: "picked.apk"
-        if (!ProjectLayout.isApkLike(name)) post("[!] $name: not .apk/.apks/.xapk/.apkm/.apk+ — trying anyway")
-        val dir = File(cacheDir, "import").apply { deleteRecursively(); mkdirs() }
-        val file = File(dir, name)
-        post("[*] copying $name")
-        contentResolver.openInputStream(uri)!!.use { i -> file.outputStream().use { i.copyTo(it) } }
-        val r = Forge().decompile(file, outRoot, uiLog, sourceLabel = name)
-        lastProject = r.dir
-        file.delete()
+        busy = true; lines.clear()
+        thread(name = "import") {
+            try {
+                val dir = File(cacheDir, "import").apply { deleteRecursively(); mkdirs() }
+                val file = File(dir, name)
+                runOnUiThread { lines += "[*] copying $name" }
+                contentResolver.openInputStream(uri)!!.use { i -> file.outputStream().use { i.copyTo(it) } }
+                runOnUiThread {
+                    busy = false
+                    if (!ProjectLayout.isApkLike(name)) lines += "[!] $name: not .apk/.apks/.xapk/.apkm/.apk+ — trying anyway"
+                    submit(ForgeService.DECOMPILE, Bundle().apply {
+                        putString("src", file.path); putString("out", Storage.projectsRoot(this@MainActivity).path)
+                        putString("label", name)
+                    })
+                }
+            } catch (t: Throwable) {
+                runOnUiThread { lines += "[x] ${t.javaClass.simpleName}: ${t.message}"; busy = false }
+            }
+        }
     }
 
-    private fun runInstalled(app: ApplicationInfo) = background("decompile") {
+    private fun runInstalled(app: ApplicationInfo) {
         val paths = listOf(File(app.sourceDir)) + app.splitSourceDirs.orEmpty().map(::File)
-        post("[*] ${app.packageName}: ${paths.size} APK(s)")
-        val r = Forge().decompile(File(app.sourceDir), outRoot, uiLog, slug = app.packageName,
-            extraSplits = if (paths.size > 1) paths else emptyList(), sourceLabel = app.packageName)
-        lastProject = r.dir
+        submit(ForgeService.DECOMPILE, Bundle().apply {
+            putString("src", app.sourceDir); putString("out", Storage.projectsRoot(this@MainActivity).path)
+            putString("slug", app.packageName); putString("label", app.packageName)
+            if (paths.size > 1) putStringArrayList("splits", ArrayList(paths.map { it.path }))
+        })
+        lines += "[*] ${app.packageName}: ${paths.size} APK(s)"
     }
 
     private fun runRebuild() {
         val p = lastProject ?: return
-        background("rebuild") { lastApk = Rebuilder(uiLog).rebuild(p) }
+        submit(ForgeService.REBUILD, Bundle().apply { putString("project", p.path) })
     }
 
     private fun install(apk: File) {
