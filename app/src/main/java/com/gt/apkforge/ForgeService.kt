@@ -49,11 +49,12 @@ class ForgeService : Service() {
         running = true
         startForegroundService(Intent(this, ForgeService::class.java))
         val d = m.data
+        val what = m.what // Message is recycled after this callback returns
         thread(name = "forge-job") {
             val out = Bundle()
             try {
                 val log = remoteLog(reply)
-                when (m.what) {
+                when (what) {
                     DECOMPILE -> {
                         val paths = d.getStringArrayList("splits").orEmpty().map(::File)
                         val r = Forge().decompile(
@@ -72,6 +73,7 @@ class ForgeService : Service() {
                 out.putString("error", "${t.javaClass.simpleName}: ${t.message}\n" +
                     ForgeLog.stackTrace(t).lineSequence().take(15).joinToString("\n"))
             }
+            if (d.getBoolean("temp")) File(d.getString("src")!!).delete()
             out.putString("heap", "heap max ${Runtime.getRuntime().maxMemory() shr 20} MB")
             Handler(Looper.getMainLooper()).post {
                 running = false
