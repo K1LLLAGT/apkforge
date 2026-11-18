@@ -255,7 +255,7 @@ ${c_g}Decompile${c_0}
                --smali-only  --java-only  -j N  -m 3g
 
 ${c_g}Build${c_0}
-  apkforge rebuild <project>         apktool b -> zipalign -> sign -> dist/
+  apkforge rebuild <project>         apktool/APKEditor build -> zipalign -> sign -> dist/
   apkforge merge <bundle|dir> [--output out.apk]   merge splits into one APK
   apkforge sign <apk> [--output out.apk]           zipalign + debug-sign
   apkforge install <project|apk>     open the APK in the system installer
@@ -402,12 +402,19 @@ cmd_batch(){
 
 cmd_rebuild(){
   parse_opts "$@"; [[ ${#ARGS[@]} -ge 1 ]] || die "usage: apkforge rebuild <project>"
-  need apktool
   local dir; dir=$(resolve_project "${ARGS[0]}")
   [[ -d "$dir/apktool" ]] || die "no apktool/ in $dir (decompiled with --java-only?)"
   mkdir -p "$dir/dist"
-  info "apktool b"
-  apktool b "$dir/apktool" -o "$dir/dist/unsigned.apk" "${ARGS[@]:1}" || die "apktool build failed"
+  if [[ -d "$dir/apktool/resources" ]]; then
+    apkeditor_ok || die "APKEditor missing; required to rebuild ARSCLib/APKEditor layout"
+    need java
+    info "APKEditor b"
+    java -jar "$APKEDITOR" b -i "$dir/apktool" -o "$dir/dist/unsigned.apk" || die "APKEditor build failed"
+  else
+    need apktool
+    info "apktool b"
+    apktool b "$dir/apktool" -o "$dir/dist/unsigned.apk" "${ARGS[@]:1}" || die "apktool build failed"
+  fi
   info "align + sign"
   sign_apk "$dir/dist/unsigned.apk" "$dir/dist/rebuilt-signed.apk" || die "signing failed"
   ok "$dir/dist/rebuilt-signed.apk"
@@ -488,9 +495,24 @@ norm_list(){
 cmd_compare(){
   parse_opts "$@"; [[ ${#ARGS[@]} -eq 2 ]] || die "usage: apkforge compare <projectA> <projectB> [-y]"
   local a b; a=$(resolve_project "${ARGS[0]}"); b=$(resolve_project "${ARGS[1]}")
+  local d
+  for d in "$a" "$b"; do
+    local name package version type apktool_status jadx_status java_count
+    name=$(basename "$d")
+    package=$(sed -n "s/^package: *//p" "$d/info.txt" 2>/dev/null | head -1)
+    version=$(sed -n "s/^package:.*versionCode='\([^']*\)'.*versionName='\([^']*\)'.*/code=\1 name=\2/p" "$d/info.txt" 2>/dev/null | head -1)
+    type=$(sed -n "s/^type: *//p" "$d/info.txt" 2>/dev/null | head -1)
+    apktool_status=$(sed -n "s/^apktool: *//p" "$d/info.txt" 2>/dev/null | head -1)
+    jadx_status=$(sed -n "s/^jadx: *//p" "$d/info.txt" 2>/dev/null | head -1)
+    java_count=$(find "$d/jadx" -type f -name '*.java' 2>/dev/null | wc -l)
+    printf '%s: %s (Java files: %s)\n  package: %s\n  version: %s\n  type: %s\n  apktool: %s\n  jadx: %s\n' \
+      "$([[ "$d" == "$a" ]] && echo A || echo B)" "$name" "$java_count" "${package:-unknown}" \
+      "${version:-unknown}" "${type:-unknown}" "${apktool_status:-unknown}" \
+      "${jadx_status:-unknown}"
+  done
   local ta tb; ta=$(mktemp); tb=$(mktemp)
   norm_list "$a" >"$ta"; norm_list "$b" >"$tb"
-  local k only_a only_b changed same
+  local k only_a only_b changed same rc=0
   for k in manifest smali res root; do
     only_a=$(comm -23 <(grep "^$k:" "$ta" | cut -d' ' -f1) <(grep "^$k:" "$tb" | cut -d' ' -f1))
     only_b=$(comm -13 <(grep "^$k:" "$ta" | cut -d' ' -f1) <(grep "^$k:" "$tb" | cut -d' ' -f1))
@@ -503,8 +525,13 @@ cmd_compare(){
       [[ -n "$only_a" ]] && sed 's/^/  - /' <<<"$only_a"
       [[ -n "$only_b" ]] && sed 's/^/  + /' <<<"$only_b"
     fi
+    if [[ "$k" == manifest || "$k" == smali ]] &&
+      ! diff -q <(grep "^$k:" "$ta") <(grep "^$k:" "$tb") >/dev/null; then
+      rc=1
+    fi
   done
   rm -f "$ta" "$tb"
+  return "$rc"
 }
 
 cmd_show(){ [[ $# -ge 1 ]] || die "usage: apkforge show <project>"; cat "$(resolve_project "$1")/info.txt"; }
