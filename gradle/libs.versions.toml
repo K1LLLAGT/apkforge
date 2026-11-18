@@ -1,0 +1,47 @@
+[versions]
+agp = "9.1.0"
+kotlin = "2.3.21"
+coroutines = "1.11.0"
+jadx = "1.5.6"
+arsclib = "1.4.0"
+smali = "3.0.9"
+apksig = "9.1.0"
+composeBom = "2025.10.01"
+activityCompose = "1.11.0"
+lifecycle = "2.9.4"
+navigation = "2.9.5"
+coreKtx = "1.17.0"
+datastore = "1.1.7"
+desugar = "2.1.5"
+junit = "4.13.2"
+
+[libraries]
+kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
+kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
+jadx-core = { module = "io.github.skylot:jadx-core", version.ref = "jadx" }
+jadx-dex-input = { module = "io.github.skylot:jadx-dex-input", version.ref = "jadx" }
+arsclib = { module = "io.github.reandroid:ARSCLib", version.ref = "arsclib" }
+smali = { module = "com.android.tools.smali:smali", version.ref = "smali" }
+baksmali = { module = "com.android.tools.smali:smali-baksmali", version.ref = "smali" }
+apksig = { module = "com.android.tools.build:apksig", version.ref = "apksig" }
+androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "coreKtx" }
+androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activityCompose" }
+androidx-lifecycle-runtime-compose = { module = "androidx.lifecycle:lifecycle-runtime-compose", version.ref = "lifecycle" }
+androidx-lifecycle-viewmodel-compose = { module = "androidx.lifecycle:lifecycle-viewmodel-compose", version.ref = "lifecycle" }
+androidx-lifecycle-service = { module = "androidx.lifecycle:lifecycle-service", version.ref = "lifecycle" }
+androidx-navigation-compose = { module = "androidx.navigation:navigation-compose", version.ref = "navigation" }
+androidx-datastore-preferences = { module = "androidx.datastore:datastore-preferences", version.ref = "datastore" }
+compose-bom = { module = "androidx.compose:compose-bom", version.ref = "composeBom" }
+compose-ui = { module = "androidx.compose.ui:ui" }
+compose-ui-tooling = { module = "androidx.compose.ui:ui-tooling" }
+compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling-preview" }
+compose-material3 = { module = "androidx.compose.material3:material3" }
+compose-material-icons = { module = "androidx.compose.material:material-icons-extended", version = "1.7.8" }
+desugar-jdk-libs = { module = "com.android.tools:desugar_jdk_libs", version.ref = "desugar" }
+slf4j-api = { module = "org.slf4j:slf4j-api", version = "2.0.18" }
+junit = { module = "junit:junit", version.ref = "junit" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
