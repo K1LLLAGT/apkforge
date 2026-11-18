@@ -24,8 +24,10 @@ Decompile, browse, rebuild and re-sign Android apps — on the device, no Termux
 
 `apktool/` from the CLI is real apktool output (`res/`, `smali_classesN/`, `apktool.yml`). The
 app/engine writes the ARSCLib/APKEditor layout (`resources/package_N/res/`, `root/`,
-`smali/classesN/`) – it can be rebuilt by the app, by `apkforge rebuild` (via APKEditor) or by
-`java -jar APKEditor.jar b`. `apkforge compare <A> <B>` normalises both layouts and reports identical/changed/only-in-one files per category (`-y` lists them).
+`smali/classesN/`) – it can be rebuilt by the app, by `apkforge rebuild` (via APKEditor when
+`apktool/resources/` exists, otherwise apktool) or by `java -jar APKEditor.jar b`.
+`apkforge compare <A> <B>` normalises both layouts and reports identical/changed/only-in-one files
+per category (`-y` lists them); its exit status is nonzero when manifests or smali differ.
 
 ## Building
 
@@ -48,8 +50,9 @@ references anything newer than minSdk 26.
 
 ## CI
 
-Every push builds debug + release APKs, runs the engine tests, the dex API check and the
-engine smoke test, and uploads `ApkForge-debug-<run>` as an artifact. Pushing a `v*` tag
+Every push builds debug + release APKs, runs the engine tests, the dex API check, the
+engine smoke test and the CLI compare check, and uploads `ApkForge-debug-<run>` as an artifact.
+Pushing a `v*` tag
 publishes a GitHub Release with `ApkForge.apk`.
 
 The app and CI builds are signed with the committed `app/apkforge-debug.keystore` so new

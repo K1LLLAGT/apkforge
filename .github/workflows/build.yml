@@ -39,6 +39,11 @@ jobs:
       - name: Engine smoke test (decompile -> rebuild -> verify)
         run: tools/engine-smoke.sh
 
+      - name: CLI syntax and compare test
+        run: |
+          bash -n cli/apkforge
+          tools/cli-compare-test.sh
+
       - name: Upload debug APK
         uses: actions/upload-artifact@v6
         with:
