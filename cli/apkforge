@@ -262,6 +262,7 @@ ${c_g}Build${c_0}
 
 ${c_g}Manage${c_0}
   apkforge list                      projects + status
+  apkforge compare <A> <B> [-y]      diff two projects' smali/res/manifest (any layout); -y lists files
   apkforge show <project>            print a project's info.txt
   apkforge log <project>             view its decompile.log
   apkforge clean <project> | --all [-y]
@@ -458,6 +459,54 @@ cmd_list(){
   (( n )) || info "no projects yet"
 }
 
+# Normalised "<kind>:<path> <sha1>" listing of a project's apktool/ dir, so apktool output
+# (smali_classesN/, res/) and ARSCLib/APKEditor output (smali/classesN/, resources/package_N/)
+# can be compared. Smali is keyed by class path only; the classesN split is ignored.
+norm_list(){
+  local d="$1/apktool"; [[ -d "$d" ]] || die "no apktool/ in $1 (decompiled with --java-only?)"
+  ( cd "$d"
+    find . -type f -print0 | while IFS= read -r -d '' f; do
+      f=${f#./}; local k="" r=""
+      case "$f" in
+        smali/classes/*)       k=smali; r=${f#smali/classes/};;
+        smali/classes[0-9]*/*) k=smali; r=${f#smali/classes*/};;
+        smali_classes[0-9]*/*) k=smali; r=${f#smali_classes*/};;
+        smali/*)               k=smali; r=${f#smali/};;
+        resources/package_*/res/*) k=res; r=${f#resources/package_*/res/};;
+        resources/package_*/AndroidManifest.xml) k=manifest; r=AndroidManifest.xml;;
+        res/*)                 k=res; r=${f#res/};;
+        AndroidManifest.xml)   k=manifest; r=$f;;
+        root/*)                k=root; r=${f#root/};;
+        unknown/*)             k=root; r=${f#unknown/};;
+        assets/*|lib/*|kotlin/*|META-INF/*) k=root; r=$f;;
+        *) continue;;
+      esac
+      printf '%s:%s %s\n' "$k" "$r" "$(sha1sum <"$f" | cut -d' ' -f1)"
+    done ) | sort
+}
+
+cmd_compare(){
+  parse_opts "$@"; [[ ${#ARGS[@]} -eq 2 ]] || die "usage: apkforge compare <projectA> <projectB> [-y]"
+  local a b; a=$(resolve_project "${ARGS[0]}"); b=$(resolve_project "${ARGS[1]}")
+  local ta tb; ta=$(mktemp); tb=$(mktemp)
+  norm_list "$a" >"$ta"; norm_list "$b" >"$tb"
+  local k only_a only_b changed same
+  for k in manifest smali res root; do
+    only_a=$(comm -23 <(grep "^$k:" "$ta" | cut -d' ' -f1) <(grep "^$k:" "$tb" | cut -d' ' -f1))
+    only_b=$(comm -13 <(grep "^$k:" "$ta" | cut -d' ' -f1) <(grep "^$k:" "$tb" | cut -d' ' -f1))
+    same=$(comm -12 <(grep "^$k:" "$ta") <(grep "^$k:" "$tb") | wc -l)
+    changed=$(comm -12 <(grep "^$k:" "$ta" | cut -d' ' -f1) <(grep "^$k:" "$tb" | cut -d' ' -f1) | wc -l)
+    changed=$(( changed - same ))
+    printf '%-9s identical %-6s changed %-6s only-A %-6s only-B %s\n' "$k" "$same" "$changed" \
+      "$(grep -c . <<<"$only_a")" "$(grep -c . <<<"$only_b")"
+    if (( OPT_YES )); then
+      [[ -n "$only_a" ]] && sed 's/^/  - /' <<<"$only_a"
+      [[ -n "$only_b" ]] && sed 's/^/  + /' <<<"$only_b"
+    fi
+  done
+  rm -f "$ta" "$tb"
+}
+
 cmd_show(){ [[ $# -ge 1 ]] || die "usage: apkforge show <project>"; cat "$(resolve_project "$1")/info.txt"; }
 cmd_log(){  [[ $# -ge 1 ]] || die "usage: apkforge log <project>"; "${PAGER:-less}" "$(resolve_project "$1")/decompile.log"; }
 
@@ -491,6 +540,7 @@ main(){
     sign)      cmd_sign "$@";;
     install)   cmd_install "$@";;
     list|ls)   cmd_list "$@";;
+    compare|cmp) cmd_compare "$@";;
     show)      cmd_show "$@";;
     log)       cmd_log "$@";;
     clean)     cmd_clean "$@";;

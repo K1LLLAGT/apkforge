@@ -25,7 +25,7 @@ Decompile, browse, rebuild and re-sign Android apps — on the device, no Termux
 `apktool/` from the CLI is real apktool output (`res/`, `smali_classesN/`, `apktool.yml`). The
 app/engine writes the ARSCLib/APKEditor layout (`resources/package_N/res/`, `root/`,
 `smali/classesN/`) – it can be rebuilt by the app, by `apkforge rebuild` (via APKEditor) or by
-`java -jar APKEditor.jar b`. `apkforge compare` normalises both layouts.
+`java -jar APKEditor.jar b`. `apkforge compare <A> <B>` normalises both layouts and reports identical/changed/only-in-one files per category (`-y` lists them).
 
 ## Building
 
