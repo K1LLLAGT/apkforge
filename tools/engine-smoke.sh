@@ -46,8 +46,14 @@ if [[ -f "$AAB" ]]; then
   # runnable "all" jar is only published on GitHub releases (Maven's jar has no Main-Class)
   BTV=$(git ls-remote --tags https://github.com/google/bundletool | grep -oE 'refs/tags/[0-9.]+$' | sed 's|refs/tags/||' | sort -V | tail -1)
   curl -fsSL -o "$OUT/bundletool.jar" "https://github.com/google/bundletool/releases/download/$BTV/bundletool-all-$BTV.jar"
-  java -jar "$OUT/bundletool.jar" build-apks --bundle="$AAB" --output="$OUT/sample.apks"
-  unzip -l "$OUT/sample.apks" | tail -n +4 | head -20
+  # splits for one phone (like an SAI/installed-app export): base + abi + density + language
+  cat > "$OUT/device.json" <<'JSON'
+{"supportedAbis":["arm64-v8a"],"supportedLocales":["en-US"],"screenDensity":640,"sdkVersion":34}
+JSON
+  java -jar "$OUT/bundletool.jar" build-apks --bundle="$AAB" --output="$OUT/sample.apks" --device-spec="$OUT/device.json"
+  unzip -Z1 "$OUT/sample.apks" > "$OUT/sample-entries.txt"
+  cat "$OUT/sample-entries.txt"
+  (( $(grep -c '\.apk$' "$OUT/sample-entries.txt") >= 2 )) || fail "bundletool produced no splits"
   "$ENGINE" decompile "$OUT/sample.apks" -o "$OUT" --smali-only
   S="$OUT/sample"
   check_layout "$S" no
