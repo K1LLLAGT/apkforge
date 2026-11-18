@@ -7,6 +7,7 @@ check proves nothing slipped through (jadx/ARSCLib/smali were written for deskto
 usage: check-dex-api.py <apk> <min-sdk> [sdk-dir]
 """
 import os, re, subprocess, sys, tempfile, zipfile, glob
+from decimal import Decimal
 import xml.etree.ElementTree as ET
 
 # Referenced but only on code paths the engine never runs (desktop GUI/image helpers in
@@ -27,7 +28,7 @@ def main():
     dexdump = sorted(glob.glob(os.path.join(sdk, "build-tools", "*", "dexdump")))[-1]
 
     def ver(v):  # "36.1" style minor SDK versions appear in newer platforms
-        return int(float(v))
+        return Decimal(v)
 
     classes = {}
     for c in ET.parse(api_xml).getroot().findall("class"):

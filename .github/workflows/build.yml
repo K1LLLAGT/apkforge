@@ -32,7 +32,9 @@ jobs:
         run: ./gradlew --stacktrace :engine:test :engine:installDist :app:assembleDebug :app:assembleRelease :app:bundleDebug
 
       - name: Check dex API level (minSdk 26)
-        run: python3 tools/check-dex-api.py app/build/outputs/apk/debug/app-debug.apk 26 "$ANDROID_HOME"
+        run: |
+          python3 -B -m unittest discover -s tools -p 'test_check_dex_api.py'
+          python3 tools/check-dex-api.py app/build/outputs/apk/debug/app-debug.apk 26 "$ANDROID_HOME"
 
       - name: Engine smoke test (decompile -> rebuild -> verify)
         run: tools/engine-smoke.sh
